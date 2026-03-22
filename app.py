@@ -12,13 +12,13 @@ from pricing_engine import calculate_quote
 # PAGE CONFIG
 # ──────────────────────────────────────────────
 st.set_page_config(
-    page_title="ARLO • Trade Quoting",
+    page_title="ARLO PRICING ASSISTANT• Trade Quoting",
     page_icon="⚡",
     layout="centered"
 )
 
 # ──────────────────────────────────────────────
-# DATABASE (LOCAL SQLITE)
+# DATABASE
 # ──────────────────────────────────────────────
 @st.cache_resource
 def get_db():
@@ -63,7 +63,7 @@ def clean_phone(p):
     return "".join([c for c in str(p) if c.isdigit()])
 
 # ──────────────────────────────────────────────
-# SAFE PDF
+# PDF GENERATOR
 # ──────────────────────────────────────────────
 def make_pdf(quote, user_name, cfg, final_ex, final_inc):
     pdf = FPDF()
@@ -83,11 +83,11 @@ def make_pdf(quote, user_name, cfg, final_ex, final_inc):
     pdf.cell(0, 8, "Items", ln=True)
 
     pdf.set_font("Arial", "", 10)
-    for item in quote["boq_snapshot"]:
-        pdf.cell(0, 6, f"- {item['name']}", ln=True)
+    for item in quote.get("boq_snapshot", []):
+        pdf.cell(0, 6, f"- {item.get('name', 'Unnamed')}", ln=True)
         pdf.cell(
             0, 6,
-            f"Labour: R {item['labour_sell']:.2f} | Material: R {item['material_sell']:.2f}",
+            f"Labour: R {item.get('labour_sell', 0):.2f} | Material: R {item.get('material_sell', 0):.2f}",
             ln=True
         )
 
@@ -98,7 +98,6 @@ def make_pdf(quote, user_name, cfg, final_ex, final_inc):
     pdf.cell(0, 8, f"Total (incl VAT): R {final_inc:.2f}", ln=True)
 
     pdf.ln(10)
-
     pdf.set_font("Arial", "", 10)
     pdf.multi_cell(0, 5, "Payment terms: 50% deposit, balance on completion. Valid 14 days.")
 
@@ -108,7 +107,7 @@ def make_pdf(quote, user_name, cfg, final_ex, final_inc):
 # LOGIN
 # ──────────────────────────────────────────────
 if not st.session_state.user:
-    st.title("ARLO PRICING ASSISTANT ⚡ Trade Quoting")
+    st.title("ARLO ⚡ Trade Quoting")
 
     phone_input = st.text_input("WhatsApp Number", placeholder="e.g. 0721234567")
     phone = clean_phone(phone_input)
@@ -123,26 +122,16 @@ if not st.session_state.user:
     st.stop()
 
 # ──────────────────────────────────────────────
-# USER GREETING + SIDEBAR INFO
+# GREETING
 # ──────────────────────────────────────────────
 user_phone = st.session_state.user
 user_name = BUSINESS_MAP.get(user_phone, user_phone)
 
-# Nice greeting banner
 st.markdown(
     f"""
-    <div style="
-        background: linear-gradient(135deg, #1e3a8a, #3b82f6);
-        color: white;
-        padding: 24px;
-        border-radius: 12px;
-        margin-bottom: 28px;
-        text-align: center;
-    ">
+    <div style="background: linear-gradient(135deg, #1e3a8a, #3b82f6); color: white; padding: 24px; border-radius: 12px; margin-bottom: 28px; text-align: center;">
         <h2 style="margin: 0; font-size: 2.1rem;">👋 Welcome back, {user_name}!</h2>
-        <p style="margin: 12px 0 0; font-size: 1.1rem; opacity: 0.95;">
-            Ready to create another sharp quote? ⚡
-        </p>
+        <p style="margin: 12px 0 0; font-size: 1.1rem; opacity: 0.95;">Ready to create another sharp quote? ⚡</p>
     </div>
     """,
     unsafe_allow_html=True
@@ -152,7 +141,7 @@ st.sidebar.markdown(f"**Logged in as**  \n{user_name}")
 st.sidebar.markdown(f"Phone: `{user_phone}`")
 
 # ──────────────────────────────────────────────
-# INDUSTRY
+# INDUSTRY + SETTINGS
 # ──────────────────────────────────────────────
 industry = st.selectbox(
     "Industry",
@@ -162,35 +151,13 @@ industry = st.selectbox(
 
 cfg = INDUSTRY_CONFIGS[industry]
 
-# ──────────────────────────────────────────────
-# INPUTS
-# ──────────────────────────────────────────────
 col1, col2, col3 = st.columns(3)
-
-monthly_cost = col1.number_input(
-    "Monthly Cost (R)",
-    value=float(cfg["default_monthly_cost"]),
-    step=1000.0,
-    min_value=0.0
-)
-
-billable_hours = col2.number_input(
-    "Billable Hours / Month",
-    value=float(cfg["default_billable_hours"]),
-    step=5.0,
-    min_value=1.0
-)
-
-profit = col3.slider(
-    "Profit Multiplier",
-    1.1,
-    3.0,
-    float(cfg["default_profit_multiplier"]),
-    step=0.1
-)
+monthly_cost = col1.number_input("Monthly Cost (R)", value=float(cfg["default_monthly_cost"]), step=1000.0, min_value=0.0)
+billable_hours = col2.number_input("Billable Hours / Month", value=float(cfg["default_billable_hours"]), step=5.0, min_value=1.0)
+profit = col3.slider("Profit Multiplier", 1.1, 3.0, float(cfg["default_profit_multiplier"]), step=0.1)
 
 # ──────────────────────────────────────────────
-# ITEMS (with basic persistence fix)
+# ITEMS (with persistence & delete)
 # ──────────────────────────────────────────────
 st.subheader("Items")
 
@@ -214,7 +181,6 @@ for i in range(len(st.session_state.boq)):
 
 st.session_state.boq = updated_boq
 
-# Prepare items for calculation engine
 items = [
     {
         "name": it["name"],
@@ -222,57 +188,94 @@ items = [
         "material_cost": it["material"]
     }
     for it in st.session_state.boq
-    if it["name"].strip()  # skip empty descriptions
+    if it["name"].strip()
 ]
 
 # ──────────────────────────────────────────────
-# CALCULATION & OUTPUT
+# CALCULATION + PRICE SELECTION
 # ──────────────────────────────────────────────
 if items:
-    quote = calculate_quote(
-        items,
-        cfg,
-        monthly_cost,
-        billable_hours,
-        profit
-    )
+    quote = calculate_quote(items, cfg, monthly_cost, billable_hours, profit)
 
     if not quote or "error" in quote:
         st.error("Calculation failed — check pricing engine")
         st.stop()
 
-    final_ex = quote["final_price"]
+    target_price = quote["final_price"]                               # full calculated price
+    suggested_price = round(target_price * 0.92, 2)                   # ~8% below target
+    walk_away_price = round(target_price * 0.80, 2)                   # minimum walk-away
+
+    st.markdown("---")
+    st.subheader("Price Selection")
+
+    # Three-option selector
+    price_choice = st.radio(
+        "Choose your quote price (ex VAT):",
+        options=[
+            f"🎯 Target Price — R {target_price:,.2f} (full calculated value)",
+            f"💡 Suggested Price — R {suggested_price:,.2f} (recommended sweet spot)",
+            f"⚠️ Walk-away Price — R {walk_away_price:,.2f} (absolute minimum)"
+        ],
+        index=1,  # default to suggested
+        captions=["Most profitable but may lose jobs", "Balanced – good win rate", "Protects margin – use only if needed"],
+        horizontal=False
+    )
+
+    # Extract chosen base
+    if "Target" in price_choice:
+        base_price = target_price
+    elif "Suggested" in price_choice:
+        base_price = suggested_price
+    else:
+        base_price = walk_away_price
+
+    # Discount negotiator
+    discount_pct = st.slider(
+        "Negotiable Discount (%)",
+        min_value=0.0,
+        max_value=25.0,
+        value=0.0,
+        step=0.5,
+        help="Apply only after selecting base price. Higher discounts reduce margin."
+    )
+
+    final_ex = round(base_price * (1 - discount_pct / 100), 2)
     final_inc = round(final_ex * 1.15, 2)
 
     st.markdown("---")
     col_a, col_b = st.columns([3, 2])
 
     with col_a:
-        st.metric("Total ex VAT", f"R {final_ex:,.2f}")
-        st.metric("Total incl VAT (15%)", f"R {final_inc:,.2f}")
+        st.metric("Selected Base (ex VAT)", f"R {base_price:,.2f}")
+        st.metric("After Discount (ex VAT)", f"R {final_ex:,.2f}")
+        st.metric("Final incl. 15% VAT", f"R {final_inc:,.2f}")
 
     with col_b:
         col_save, col_pdf = st.columns(2)
 
-        if col_save.button("💾 Save Quote"):
+        can_save = price_choice is not None  # always true once rendered, but explicit
+
+        if col_save.button("💾 Save Quote", disabled=not can_save, use_container_width=True):
             conn = get_db()
             conn.execute(
                 "INSERT INTO quotes (phone, industry, final_ex, final_inc, created_at) VALUES (?, ?, ?, ?, ?)",
                 (user_phone, industry, final_ex, final_inc, datetime.now().isoformat())
             )
             conn.commit()
-            st.success("Quote saved!")
+            st.success("Quote saved successfully!")
 
         pdf_bytes = make_pdf(quote, user_name, cfg, final_ex, final_inc)
 
         col_pdf.download_button(
             label="📄 Download PDF",
             data=pdf_bytes,
-            file_name=f"ARLO_Quote_{datetime.now().strftime('%Y%m%d')}.pdf",
-            mime="application/pdf"
+            file_name=f"ARLO_Quote_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+            mime="application/pdf",
+            disabled=not can_save,
+            use_container_width=True
         )
 
 else:
-    st.info("Add at least one item with a description to see the quote.")
+    st.info("Add at least one item with a description to calculate prices.")
 
-st.caption("ARLO • Built for South African tradespeople • Valid quotes 14 days")
+st.caption("ARLO • Smart quoting for South African trades • Quotes valid 14 days")
