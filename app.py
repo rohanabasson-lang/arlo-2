@@ -1,443 +1,312 @@
-import streamlit as st
+import json
 import sqlite3
-import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
+
+import streamlit as st
 from fpdf import FPDF
 
-# =========================================================
+from industry_configs import INDUSTRY_CONFIGS
+from pricing_engine import calculate_quote
+
+# ──────────────────────────────────────────────
 # CONFIG
-# =========================================================
+# ──────────────────────────────────────────────
+MAX_FREE_QUOTES = 15
+
 st.set_page_config(
-    page_title="ARLO Pricing Engine",
-    page_icon="🏗️",
-    layout="wide"
+    page_title="ARLO Pricing Assistant",
+    page_icon="⚡",
+    layout="centered"
 )
 
-DB_PATH = "arlo.db"
+# ──────────────────────────────────────────────
+# DATABASE
+# ──────────────────────────────────────────────
+@st.cache_resource
+def get_db():
+    conn = sqlite3.connect("arlo.db", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-ADMIN_NUMBERS = ["0659994443", "0736826931"]
-
-AUTHORIZED_USERS = {
-    "0795659007": "Ahluma Construction and Trading",
-    "0815555088": "Ben Lutumba Construction",
-    "0626011810": "Imabacon Projects",
-    "0829980714": "Orion Shades and Steel Worx",
-    "0730434326": "TAAL Projects and Civil Contractors",
-    "0693794420": "Tripoli Private Investigators Security Systems Pty Ltd",
-    "0631172296": "Volts and Amps Engineering (Solar/Electrical)",
-    "0828431430": "Marz Construction",
-    "0792001200": "Comma Group Pty Ltd",
-    "0678201965": "JMF Construction",
-    "0768976484": "Kusasa Projects and Maintenance Pty Ltd",
-    "0731196550": "Energon Holdings Pty Ltd",
-    "0678866227": "Reliable Painters Pty Ltd",
-    "0656611289": "Lenyakallo Projects",
-    "0730970027": "Myc-services Construction Pty Ltd",
-    "0678250880": "NBH Construction Pty Ltd",
-    "0795970690": "Bra Joe Steelworks and Construction",
-    "0719152903": "Jobfellas",
-    "0799722549": "Wiseinn Landscapes",
-    "0787247849": "M S Kathide",
-    "0660548678": "Ngwenya Property Rehab",
-    "0672567151": "Ipotau Projects",
-    "0659994443": "The Profit Prophet (Admin)",
-    "0736826931": "Rohan Basson (Admin)",
-    "0699307681": "Apex Electro Dynamics",
-    "0686807333": "Boneh Projects",
-    "0722396885": "Power Water Solutions",
-    "0620136344": "Loyal Construction",
-    "0660417821": "Handyman Andries",
-    "0718357947": "Champion Renovations"
-}
-
-# =========================================================
-# STYLING
-# =========================================================
-st.markdown(
-    """
-    <style>
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
-        max-width: 1100px;
-    }
-    .stMetric {
-        background: #0f172a;
-        border: 1px solid #1e293b;
-        padding: 14px;
-        border-radius: 14px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-# =========================================================
-# DB SETUP
-# =========================================================
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-conn.execute("PRAGMA journal_mode=WAL;")
-c = conn.cursor()
-
-c.execute("""
-CREATE TABLE IF NOT EXISTS quotes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_phone TEXT,
-    client_name TEXT,
-    project TEXT,
-    total_direct_cost REAL,
-    labour_portion REAL,
-    material_portion REAL,
-    overhead_pct REAL,
-    overhead_amount REAL,
-    total_cost REAL,
-    price REAL,
-    suggested REAL,
-    profit REAL,
-    margin REAL,
-    walk_away REAL,
-    timestamp TEXT
-)
-""")
-conn.commit()
-
-# =========================================================
-# HELPERS
-# =========================================================
-def save_quote(data: tuple) -> None:
-    c.execute("""
-    INSERT INTO quotes (
-        user_phone, client_name, project,
-        total_direct_cost, labour_portion, material_portion,
-        overhead_pct, overhead_amount, total_cost,
-        price, suggested, profit, margin, walk_away, timestamp
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, data)
+def init_db():
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS quotes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT,
+            industry TEXT,
+            final_ex REAL,
+            final_inc REAL,
+            created_at TEXT
+        )
+    """)
     conn.commit()
 
-def get_user_quotes(phone: str) -> pd.DataFrame:
-    return pd.read_sql_query(
-        "SELECT * FROM quotes WHERE user_phone=? ORDER BY id DESC",
-        conn,
-        params=(phone,)
-    )
+init_db()
 
-def get_all_quotes() -> pd.DataFrame:
-    return pd.read_sql_query(
-        "SELECT * FROM quotes ORDER BY id DESC",
-        conn
-    )
+# ──────────────────────────────────────────────
+# AUTH
+# ──────────────────────────────────────────────
+AUTH_USERS = st.secrets["auth"]["AUTHORIZED_USERS"]
+BUSINESS_MAP = st.secrets["auth"]["business_names"]
 
-def make_pdf_bytes(
-    user_name: str,
-    project_name: str,
-    total_direct_cost: float,
-    labour_portion: float,
-    material_portion: float,
-    overhead_pct: float,
-    overhead_amount: float,
-    total_cost: float,
-    price: float,
-    suggested: float,
-    profit: float,
-    margin: float,
-    walk_away: float,
-    items: list[dict],
-) -> bytes:
+# ──────────────────────────────────────────────
+# SESSION STATE
+# ──────────────────────────────────────────────
+if "user" not in st.session_state:
+    st.session_state.user = None
+if "boq" not in st.session_state:
+    st.session_state.boq = []
+
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
+def clean_phone(x):
+    return "".join(c for c in str(x) if c.isdigit())
+
+def get_quote_count(phone):
+    conn = get_db()
+    return conn.execute(
+        "SELECT COUNT(*) FROM quotes WHERE phone = ?",
+        (phone,)
+    ).fetchone()[0]
+
+# ──────────────────────────────────────────────
+# PDF (Improved)
+# ──────────────────────────────────────────────
+def make_pdf(quote, user_name, cfg, final_ex, final_inc, discount_pct):
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
 
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(190, 10, "ARLO QUOTATION", ln=True, align="C")
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "ARLO QUOTE", ln=True, align="C")
 
-    pdf.ln(4)
-    pdf.set_font("Arial", size=11)
-    pdf.cell(190, 8, f"Client: {user_name}", ln=True)
-    pdf.cell(190, 8, f"Project / Service: {project_name}", ln=True)
-    pdf.cell(190, 8, f"Date: {datetime.now().strftime('%Y-%m-%d')}", ln=True)
-    valid_until = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
-    pdf.cell(190, 8, f"Valid until: {valid_until}", ln=True)
-
-    pdf.ln(8)
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(190, 8, "Price Summary", ln=True)
-
-    pdf.set_font("Arial", size=11)
-    summary_text = (
-        f"Total Price (excl. VAT): R{price:,.0f}\n"
-        f"VAT @ 15% will be added where applicable.\n"
-        f"Amount due (incl. VAT): R{price * 1.15:,.0f}"
-    )
-    pdf.multi_cell(180, 7, summary_text)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 8, f"Client: {user_name}", ln=True)
+    pdf.cell(0, 8, f"Industry: {cfg['label']}", ln=True)
+    pdf.cell(0, 8, f"Date: {datetime.now().strftime('%d %b %Y')}", ln=True)
 
     pdf.ln(10)
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(190, 8, "Project Breakdown", ln=True)
 
-    pdf.set_font("Arial", size=10)
-    for idx, item in enumerate(items, start=1):
-        name = item['name'] if item['name'] else f"Line {idx}"
-        line = f"{idx}. {name} — Qty: {item['qty']:,.2f} | Rate: R{item['rate']:,.0f} | Subtotal: R{item['cost']:,.0f}"
-        pdf.multi_cell(170, 6, line)
-        pdf.ln(1)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 8, "Bill of Quantities", ln=True)
+
+    pdf.set_font("Helvetica", "", 10)
+    for item in quote.get("boq_snapshot", []):
+        pdf.cell(0, 6, f"• {item.get('name', 'Unnamed item')}", ln=True)
+        pdf.cell(
+            0, 6,
+            f"   Qty: {item.get('quantity', 1)} × Labour: R {item.get('labour_sell', 0):.2f} | Material: R {item.get('material_sell', 0):.2f}",
+            ln=True
+        )
 
     pdf.ln(8)
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(190, 8, "Pricing Build-Up", ln=True)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, f"Total ex VAT:          R {final_ex:,.2f}", ln=True)
+    pdf.cell(0, 8, f"Total incl VAT (15%):  R {final_inc:,.2f}", ln=True)
 
-    pdf.set_font("Arial", size=11)
-    build_up_text = (
-        f"Total Direct Costs (from items):       R{total_direct_cost:,.0f}\n"
-        f"Overhead ({overhead_pct:.1f}%):                 R{overhead_amount:,.0f}\n"
-        f"───────────────────────────────────────\n"
-        f"Total Cost:                              R{total_cost:,.0f}\n"
-        f"Profit / Margin ({margin:.1f}%):          R{profit:,.0f}\n"
-        f"───────────────────────────────────────\n"
-        f"Total Price (excl. VAT):           **R{price:,.0f}**"
-    )
-    pdf.multi_cell(180, 7, build_up_text)
+    pdf.ln(10)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.cell(0, 6, "Thank you for choosing ARLO — built for profit.", ln=True)
 
-    pdf.ln(12)
-    footer = (
-        "Prepared by ARLO – The Profit Prophet\n\n"
-        "Payment Terms: 50% deposit on acceptance, balance on completion.\n"
-        "Inclusions: As detailed above.\n"
-        "Exclusions: Variations, additional work, unforeseen conditions.\n"
-        "All prices exclude VAT unless stated otherwise."
-    )
-    pdf.multi_cell(180, 7, footer)
+    return pdf.output(dest="S").encode("latin-1")
 
-    pdf_output = pdf.output(dest='S').encode('latin-1', errors='ignore')
-    return pdf_output
+# ──────────────────────────────────────────────
+# LOGIN
+# ──────────────────────────────────────────────
+if not st.session_state.user:
+    st.title("ARLO Pricing Assistant ⚡")
 
-# =========================================================
-# SESSION STATE
-# =========================================================
-if "items" not in st.session_state:
-    st.session_state.items = []
+    phone_input = st.text_input("WhatsApp Number", placeholder="0721234567")
+    phone = clean_phone(phone_input)
 
-if "last_saved_key" not in st.session_state:
-    st.session_state.last_saved_key = None
-
-# =========================================================
-# HEADER
-# =========================================================
-st.title("🏗️ ARLO Pricing Engine")
-st.caption("Clear. Profitable. Multi-industry quoting.")
-
-# =========================================================
-# AUTHENTICATION
-# =========================================================
-user_phone = st.text_input("WhatsApp number", placeholder="e.g. 0659994443")
-
-if not user_phone:
-    st.info("Enter your number to continue.")
-    st.stop()
-
-user_phone = user_phone.strip()
-
-if user_phone not in AUTHORIZED_USERS:
-    st.error("Number not authorized.")
-    st.stop()
-
-user_name = AUTHORIZED_USERS[user_phone]
-is_admin = user_phone in ADMIN_NUMBERS
-
-st.success(f"Welcome back, {user_name}")
-if is_admin:
-    st.info("Admin mode active")
-
-# =========================================================
-# PROJECT / SERVICE
-# =========================================================
-project_name = st.text_input("Project / Service Name", value="General Scope")
-
-# =========================================================
-# LINE ITEMS
-# =========================================================
-st.subheader("📋 Project Items")
-
-col_a, col_b = st.columns(2)
-with col_a:
-    if st.button("➕ Add Line", use_container_width=True):
-        st.session_state.items.append({
-            "name": "",
-            "qty": 1.0,
-            "rate": 0.0,
-            "labour_pct": 50
-        })
-        st.rerun()
-
-with col_b:
-    if st.button("🧹 Clear / New", use_container_width=True):
-        st.session_state.items = []
-        st.session_state.last_saved_key = None
-        st.rerun()
-
-total_direct_cost = 0.0
-labour_portion = 0.0
-material_portion = 0.0
-item_snapshot = []
-
-for i, line in enumerate(st.session_state.items):
-    with st.expander(f"Line {i+1}", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        line["name"] = c1.text_input("Description", value=line["name"], key=f"name_{i}")
-        line["qty"]  = c2.number_input("Quantity", min_value=0.0, value=float(line["qty"]), step=0.1, key=f"qty_{i}")
-        line["rate"] = c3.number_input("Unit Rate", min_value=0.0, value=float(line["rate"]), step=10.0, key=f"rate_{i}")
-
-        line["labour_pct"] = st.slider("Labour portion %", 0, 100, int(line["labour_pct"]), key=f"lab_{i}")
-
-        cost = float(line["qty"]) * float(line["rate"])
-        labour_cost   = cost * (line["labour_pct"] / 100)
-        material_cost = cost - labour_cost
-
-        total_direct_cost += cost
-        labour_portion    += labour_cost
-        material_portion  += material_cost
-
-        item_snapshot.append({
-            "name": line["name"] if line["name"] else f"Line {i+1}",
-            "qty": float(line["qty"]),
-            "rate": float(line["rate"]),
-            "cost": cost,
-        })
-
-        mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Line Total", f"R{cost:,.0f}")
-        mc2.metric("Labour", f"R{labour_cost:,.0f}")
-        mc3.metric("Material/Other", f"R{material_cost:,.0f}")
-
-        if st.button("🗑 Remove", key=f"del_{i}"):
-            st.session_state.items.pop(i)
+    if st.button("Sign In", use_container_width=True):
+        if phone in AUTH_USERS:
+            st.session_state.user = phone
             st.rerun()
+        else:
+            st.error("Not authorised")
 
-st.divider()
-
-# =========================================================
-# PRICING
-# =========================================================
-st.subheader("⚙️ Markup & Margin")
-
-c1, c2 = st.columns(2)
-with c1:
-    overhead_pct = st.number_input("Overhead / Business %", 0.0, 100.0, 20.0, step=0.5, format="%.1f")
-with c2:
-    margin_pct = st.number_input("Desired Margin %", 1.0, 99.0, 30.0, step=0.5, format="%.1f")
-
-if total_direct_cost <= 0:
-    st.info("Add at least one line item to see pricing.")
     st.stop()
 
-overhead_amount = total_direct_cost * (overhead_pct / 100)
-total_cost = total_direct_cost + overhead_amount
-price      = total_cost / (1 - margin_pct / 100)
-suggested  = price * 0.95
-profit     = price - total_cost
-margin     = (profit / price) * 100 if price > 0 else 0
-walk_away  = total_cost * 1.25
+# ──────────────────────────────────────────────
+# USER DASHBOARD
+# ──────────────────────────────────────────────
+user_phone = st.session_state.user
+user_name = BUSINESS_MAP.get(user_phone, user_phone)
 
-# =========================================================
-# RESULTS
-# =========================================================
-st.subheader("📊 Summary")
+st.markdown(f"""
+<div style="background:#111827;padding:20px;border-radius:12px;margin-bottom:20px;">
+<h3 style="color:white;">👋 Welcome back, {user_name}</h3>
+<p style="color:#9CA3AF;">Let’s build a profitable quote.</p>
+</div>
+""", unsafe_allow_html=True)
 
-cols1 = st.columns(3)
-cols1[0].metric("Direct Costs", f"R{total_direct_cost:,.0f}")
-cols1[1].metric("Labour Portion", f"R{labour_portion:,.0f}")
-cols1[2].metric("Material / Other", f"R{material_portion:,.0f}")
+# ──────────────────────────────────────────────
+# PAYWALL
+# ──────────────────────────────────────────────
+quote_count = get_quote_count(user_phone)
 
-cols2 = st.columns(3)
-cols2[0].metric("Overhead", f"R{overhead_amount:,.0f}")
-cols2[1].metric("Total Cost", f"R{total_cost:,.0f}")
-cols2[2].metric("Expected Profit", f"R{profit:,.0f}")
+st.caption(f"Quotes used: **{quote_count}/{MAX_FREE_QUOTES}**")
 
-cols3 = st.columns(3)
-cols3[0].metric("Target Price", f"R{price:,.0f}")
-cols3[1].metric("Suggested Price", f"R{suggested:,.0f}")
-cols3[2].metric("Walk-away", f"R{walk_away:,.0f}")
+if quote_count >= MAX_FREE_QUOTES:
+    st.error("🚫 Free limit reached (15 quotes)")
+    st.markdown("""
+### 🔓 Upgrade to ARLO Pro
+- Unlimited quotes  
+- Advanced pricing engine  
+- Priority support  
+💰 Only R99/month  
+""")
+    st.stop()
 
-st.metric("Achieved Margin", f"{margin:.1f}%", delta_color="normal")
+# ──────────────────────────────────────────────
+# INDUSTRY + SETTINGS
+# ──────────────────────────────────────────────
+industry = st.selectbox(
+    "Industry",
+    list(INDUSTRY_CONFIGS.keys()),
+    format_func=lambda x: INDUSTRY_CONFIGS[x]["label"]
+)
 
-if margin < 15:
-    st.error("Margin very low — high risk")
-elif margin < 25:
-    st.warning("Margin quite thin — be cautious")
+cfg = INDUSTRY_CONFIGS[industry]
+
+col1, col2, col3 = st.columns(3)
+monthly_cost = col1.number_input("Monthly Overhead (R)", value=float(cfg["default_monthly_cost"]), step=100.0)
+billable_hours = col2.number_input("Billable Hours / Month", value=float(cfg["default_billable_hours"]), step=10.0)
+profit = col3.slider("Profit Multiplier", 1.1, 3.5, float(cfg["default_profit_multiplier"]))
+
+# ──────────────────────────────────────────────
+# BOQ — FIXED & FULLY PERSISTENT
+# ──────────────────────────────────────────────
+st.subheader("📋 Bill of Quantities")
+
+c1, c2 = st.columns([3, 1])
+if c1.button("➕ Add Item", use_container_width=True):
+    st.session_state.boq.append({"name": "", "quantity": 1, "hours": 1.0, "material": 0.0})
+    st.rerun()
+
+if c2.button("🗑️ Clear All", use_container_width=True):
+    if st.session_state.boq:
+        st.session_state.boq = []
+        st.rerun()
+
+# ────── Sync loop with safe delete ──────
+updated_boq = []
+to_delete = None
+
+for i in range(len(st.session_state.boq)):
+    item = st.session_state.boq[i]
+
+    st.subheader(f"Item {i+1}")
+
+    name = st.text_input("Description", value=item["name"], key=f"name_{i}")
+    qty = st.number_input("Qty", value=item["quantity"], min_value=1, step=1, key=f"qty_{i}")
+    hours = st.number_input("Hours per unit", value=item["hours"], min_value=0.0, step=0.25, key=f"hours_{i}")
+    mat = st.number_input("Material per unit (R)", value=item["material"], min_value=0.0, step=10.0, key=f"mat_{i}")
+
+    updated_boq.append({
+        "name": name,
+        "quantity": qty,
+        "hours": hours,
+        "material": mat
+    })
+
+    if st.button("🗑️ Delete", key=f"del_{i}", help="Remove this item"):
+        to_delete = i
+
+# Apply changes
+if to_delete is not None:
+    del updated_boq[to_delete]
+    st.session_state.boq = updated_boq
+    st.rerun()
 else:
-    st.success("Healthy margin range")
+    st.session_state.boq = updated_boq
 
-# =========================================================
-# ACTIONS
-# =========================================================
-act1, act2 = st.columns(2)
+# Prepare clean items list for engine
+items = [
+    {
+        "name": it["name"],
+        "labour_hours": it["quantity"] * it["hours"],
+        "material_cost": it["quantity"] * it["material"],
+        "quantity": it["quantity"]
+    }
+    for it in st.session_state.boq
+    if it["name"].strip()
+]
 
-quote_key = (user_phone, project_name, round(total_cost,2), round(price,2), round(margin,2), len(item_snapshot))
-
-with act1:
-    if st.button("💾 Save Quote", use_container_width=True):
-        if st.session_state.last_saved_key == quote_key:
-            st.info("Already saved (no changes detected)")
-        else:
-            save_quote((
-                user_phone, user_name, project_name,
-                total_direct_cost, labour_portion, material_portion,
-                float(overhead_pct), overhead_amount, total_cost,
-                price, suggested, profit, margin, walk_away,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ))
-            st.session_state.last_saved_key = quote_key
-            st.success("Quote saved")
-
-with act2:
-    pdf_data = make_pdf_bytes(
-        user_name, project_name,
-        total_direct_cost, labour_portion, material_portion,
-        float(overhead_pct), overhead_amount, total_cost,
-        price, suggested, profit, margin, walk_away,
-        item_snapshot
+# ──────────────────────────────────────────────
+# CALCULATION
+# ──────────────────────────────────────────────
+if items:
+    quote = calculate_quote(
+        items,
+        cfg,
+        monthly_cost,
+        billable_hours,
+        profit
     )
-    st.download_button(
-        "📄 Download Quotation",
-        pdf_data,
-        file_name=f"ARLO_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+
+    if not quote or "error" in quote:
+        st.error("Calculation failed")
+        st.stop()
+
+    # Show breakdown
+    with st.expander("📊 Cost Breakdown & Details", expanded=False):
+        st.json(quote)
+
+    target = quote["final_price"]
+    rec = round(target * 0.92, 2)
+    walk = round(target * 0.80, 2)
+
+    st.subheader("Select Price Level")
+
+    choice = st.radio(
+        "Price Level",
+        ["Recommended", "Target", "Walk-away", "Custom"],
+        horizontal=True,
+        label_visibility="collapsed"
+    )
+
+    discount = st.slider("Discount %", 0.0, 25.0, 0.0, step=0.5)
+
+    if choice == "Recommended":
+        base = rec
+    elif choice == "Target":
+        base = target
+    elif choice == "Walk-away":
+        base = walk
+    else:
+        base = st.number_input("Custom Price (ex VAT)", value=float(rec), step=100.0)
+
+    final_ex = round(base * (1 - discount / 100), 2)
+    final_inc = round(final_ex * 1.15, 2)
+
+    st.metric("Final Price (ex VAT)", f"R {final_ex:,.2f}")
+    st.metric("Final Price (incl VAT)", f"R {final_inc:,.2f}")
+
+    col1, col2 = st.columns(2)
+
+    if col1.button("💾 Save Quote", use_container_width=True):
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO quotes (phone, industry, final_ex, final_inc, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_phone, industry, final_ex, final_inc, datetime.now().isoformat())
+        )
+        conn.commit()
+        st.success("Quote saved to database!")
+
+    pdf_bytes = make_pdf(quote, user_name, cfg, final_ex, final_inc, discount)
+
+    col2.download_button(
+        label="📄 Download PDF",
+        data=pdf_bytes,
+        file_name=f"ARLO_Quote_{industry}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
         mime="application/pdf",
         use_container_width=True
     )
 
-# =========================================================
-# DISCOUNT
-# =========================================================
-st.subheader("🔻 Quick Discount Check")
-disc = st.slider("Discount %", 0, 25, 0)
-
-if disc > 0:
-    new_price = price * (1 - disc/100)
-    new_profit = new_price - total_cost
-    new_margin = (new_profit / new_price)*100 if new_price > 0 else 0
-    st.warning(f"After {disc}% discount:\n\nPrice: **R{new_price:,.0f}**\nProfit: R{new_profit:,.0f}\nMargin: {new_margin:.1f}%")
-
-# =========================================================
-# HISTORY
-# =========================================================
-st.subheader("📜 Quote History")
-
-if is_admin:
-    quotes_df = get_all_quotes()
 else:
-    quotes_df = get_user_quotes(user_phone)
+    st.info("Add at least one item with a description to start calculating.")
 
-if quotes_df.empty:
-    st.info("No saved quotes yet")
-else:
-    for _, r in quotes_df.iterrows():
-        with st.expander(f"{r['timestamp']} — R{r['price']:,.0f}"):
-            st.write(f"**Client** {r['client_name']}")
-            st.write(f"**Project/Service** {r['project']}")
-            st.write(f"Total Cost: R{r['total_cost']:,.0f}")
-            st.write(f"Profit: R{r['profit']:,.0f}")
-            st.write(f"Margin: {r['margin']:.1f}%")
-            st.write(f"Suggested: R{r['suggested']:,.0f}")
-
-st.markdown("---")
-st.caption("ARLO • Multi-industry Pricing • v1.2")
+st.caption("ARLO Pricing Assistant — built for South African contractors")
